@@ -1,8 +1,8 @@
 definition(
-    name: "Nexia Thermostat Control",
+    name: "Nexia Thermostat Controller",
     namespace: "jason",
-    author: "Jason",
-    description: "Thermostat OFF when a contact sensor stays open (2 min); outdoor-temp rules (HEAT at/below 45, COOL at/above 55, OFF+fan cycle between) with selectable primary/backup temp sources + auto failover and Pushover alerts. Watchdogs re-assert mode/setpoints/fan. In-app or optional-switch maintenance pause hands control to the wall thermostat.",
+    author: "inetjnky",
+    description: "Thermostat OFF when a contact sensor stays open (2 min); outdoor-temp rules (HEAT at/below 45, COOL at/above 55, OFF+fan cycle between) with selectable primary/backup temp sources + auto failover and Pushover alerts (customizable text). Watchdogs re-assert mode/setpoints/fan. Maintenance pause (via required pause switch) sends thermostat OFF + fan auto, verifies the device confirms, then engages hands-off; rules re-apply on resume or sensor-clear, delaying COOL by the configured minutes (a brief sensor blip during the wait re-arms it).",
     category: "Convenience",
     iconUrl: "",
     iconX2Url: "",
@@ -20,20 +20,20 @@ def mainPage() {
                 title: "Nexia thermostat(s)", multiple: true, required: true, submitOnChange: true
         }
         section("Maintenance pause / resume") {
-            paragraph "Current status: ${state.paused ? '⏸ PAUSED (wall thermostat has control)' : '▶ ACTIVE (automation in control)'}"
-            if (state.paused) {
-                href(name: "resumeHref", title: "▶ Resume automation control",
-                    description: "Re-applies the outdoor-temp rules immediately",
-                    page: "resumePage")
-            } else {
-                href(name: "pauseHref", title: "⏸ Pause — hand control to the wall thermostat",
-                    description: "Nothing in Hubitat will touch the thermostat until you resume (use for technicians)",
-                    page: "pausePage")
-            }
+            paragraph "Current status: ${isPaused() ? '⏸ PAUSED (wall thermostat has control)' : '▶ ACTIVE (automation in control)'}"
             input "pauseSwitch", "capability.switch",
-                title: "Optional pause switch — ON = paused (Virtual Switch; lets you pause from a dashboard too)",
-                required: false, multiple: false, submitOnChange: true
-            paragraph "While paused: no sensor OFF, no outdoor-temp rules, no fan duty cycle, no watchdogs — the wall thermostat has exclusive control and nothing in Hubitat will undo changes. Pause state survives hub reboots. Pause/resume sends Pushover if notifications are enabled."
+                title: "Pause switch (REQUIRED — select a Virtual Switch device, e.g. 'Thermostat Guard Pause')",
+                required: true, multiple: false, submitOnChange: true
+            input "btnAction", "enum",
+                title: "Action — choose an option to execute (acts like a button)",
+                options: ["pause": "⏸ PAUSE — thermostat OFF, verified, then hands-off",
+                          "resume": "▶ RESUME — automation re-takes control (COOL delayed)",
+                          "test": "🔔 TEST — send your configured Pause message now"],
+                required: false, submitOnChange: true
+            input "coolDelayMinutes", "number",
+                title: "Minutes to delay COOL mode on resume or after all sensors close (thermostat stays off during the delay)",
+                defaultValue: 5, range: "1..120", required: true
+            paragraph "PAUSE sends mode off + fan auto, verifies the thermostat actually reports OFF (up to 3 re-sends), then engages hands-off — the in-app Action flips the pause switch ON only after that verification; flipping the switch from a dashboard runs the same apply-then-verify sequence. If OFF can't be verified, the pause still engages and you get a Pushover alert. RESUME turns the switch OFF and re-applies the outdoor-temp rules immediately — except COOL, which waits the minutes configured above while the thermostat stays off. While the switch is ON: no sensor OFF, no outdoor-temp rules, no fan duty cycle, no watchdogs. Pause state survives hub reboots."
         }
         section("Contact sensors") {
             input "contactSensors", "capability.contactSensor",
@@ -43,18 +43,16 @@ def mainPage() {
                 input "offDelayMinutes", "number",
                     title: "Minutes a sensor must stay open before OFF (timer restarts if another opens)",
                     defaultValue: 2, range: "1..120", required: true
-                input "resumeDelayMinutes", "number",
-                    title: "Minutes after ALL sensors close before re-applying outdoor temp rules",
-                    defaultValue: 5, range: "1..120", required: true
+                paragraph "After a sensor-protection OFF, once ALL sensors close the outdoor-temp rules re-apply immediately — except COOL, which waits the delay configured in the pause/resume section (thermostat stays off during that wait). A brief open→close blip during that COOL wait re-arms the wait."
             }
         }
         section("Outdoor temperature rules (°F)") {
-            paragraph "At or above the mild threshold: COOL mode at ${mildCoolSp ?: 71}<br/>" +
+            paragraph "At or above the warm threshold: COOL mode at ${mildCoolSp ?: 71}<br/>" +
                 "Between thresholds: OFF${fanCycle ? ' + fan duty cycle' : ''}<br/>" +
                 "At or below the cold threshold: HEAT mode at ${coldHeatSp ?: 72}"
-            input "mildThreshold", "number", title: "Mild threshold — COOL mode at/above this", defaultValue: 55, required: true
+            input "mildThreshold", "number", title: "Warm threshold — COOL mode at/above this", defaultValue: 55, required: true
             input "coldThreshold", "number", title: "Cold threshold — HEAT mode at/below this", defaultValue: 45, required: true
-            input "mildCoolSp", "number", title: "Cool setpoint — used at/above mild threshold (COOL mode)", defaultValue: 71, required: true
+            input "mildCoolSp", "number", title: "Cool setpoint — used at/above warm threshold (COOL mode)", defaultValue: 71, required: true
             input "coldHeatSp", "number", title: "Heat setpoint — used at/below cold threshold (HEAT mode)", defaultValue: 72, required: true
         }
         section("Outdoor temp source & failover") {
@@ -75,6 +73,33 @@ def mainPage() {
                 input "pushoverDevices", "capability.notification",
                     title: "Pushover device(s) (created by Pushover Manager)",
                     required: true, multiple: true
+                section("Pushover message text (all optional — blank field = built-in default)") {
+                    input "notifyPrefix", "text",
+                        title: "Prefix before every message (clear the field to send with NO prefix)",
+                        defaultValue: "Nexia Thermostat Guard", required: false
+                    input "msgPause", "text",
+                        title: "⏸ Pause message", required: false,
+                        defaultValue: "Maintenance PAUSE engaged — thermostat turned OFF; automation is hands-off; the wall thermostat has full control"
+                    input "msgPauseUnverified", "text",
+                        title: "⏸ Pause-unverified message — tokens: {device}", required: false,
+                        defaultValue: "PAUSE engaged but the thermostat did not confirm OFF ({device}) — if it is still running, turn it off at the wall and check the Nexia connection"
+                    input "msgResume", "text",
+                        title: "▶ Resume message", required: false,
+                        defaultValue: "Maintenance pause released — automation resumes control"
+                    input "msgFailover", "text",
+                        title: "Failover message — tokens: {device} {temp} {age}", required: false,
+                        defaultValue: "Primary outdoor temp stale (last update {age}) — failing over to backup {device} ({temp}°F)"
+                    input "msgStale", "text",
+                        title: "Stale, no-backup message — tokens: {temp} {age}", required: false,
+                        defaultValue: "Primary outdoor temp stale (last update {age}), no backup available — thermostat rules frozen on last known {temp}°F"
+                    input "msgRecovered", "text",
+                        title: "Primary-recovered message", required: false,
+                        defaultValue: "Primary outdoor temp recovered — using primary source again"
+                    input "msgNoTemp", "text",
+                        title: "No-temperature-available message", required: false,
+                        defaultValue: "No outdoor temperature available (primary and backup) — thermostat rules paused"
+                    paragraph "Tokens are replaced with live values at send time: {age} = hours since the last primary update, {device} = device name(s), {temp} = the reading used. A token with no value for that event stays as literal text — only use tokens where the title says they're supported. The app log always records the full detail no matter what these fields say. Use the 🔔 TEST action at the top of the app to preview your Pause text through the real send path."
+                }
             }
         }
         section("Fan duty cycle during OFF band (outdoor between thresholds)") {
@@ -87,7 +112,7 @@ def mainPage() {
                     defaultValue: 30, range: "1..60", required: true
                 input "fanOffMinutes", "number", title: "Minutes fan rests between cycles",
                     defaultValue: 30, range: "1..60", required: true
-                paragraph "ON phase = fan '${fanActiveMode ?: 'on'}'. 'on' runs continuously (exactly 30 min/hour with defaults); 'circulate' lets the thermostat duty-cycle internally (less actual runtime). OFF phase = fan 'auto'. The cycle pauses while any sensor is open and during the post-close resume delay."
+                paragraph "ON phase = fan '${fanActiveMode ?: 'on'}'. 'on' runs continuously (exactly 30 min/hour with defaults); 'circulate' lets the thermostat duty-cycle internally (less actual runtime). OFF phase = fan 'auto'. The cycle pauses while any sensor is open and during any pending COOL delay."
             }
         }
         section("Options") {
@@ -100,27 +125,10 @@ def mainPage() {
     }
 }
 
-def pausePage() {
-    if (!state.paused) pauseNow("app page")
-    dynamicPage(name: "pausePage", title: "Maintenance pause", nextPage: "mainPage", install: false, uninstall: false) {
-        section("Status") {
-            paragraph "⏸ PAUSED — the automation is hands-off. The wall thermostat has full control and nothing in Hubitat will undo changes made at it.\n\nOpen this app again and tap ▶ Resume when service is done."
-        }
-    }
-}
-
-def resumePage() {
-    if (state.paused) resumeNow("app page")
-    dynamicPage(name: "resumePage", title: "Resume", nextPage: "mainPage", install: false, uninstall: false) {
-        section("Status") {
-            paragraph "▶ RESUMED — the automation has re-applied its rules. Check the app log for the actions taken."
-        }
-    }
-}
-
 def installed() {
     if (state.forcedOffBySensor == null) state.forcedOffBySensor = false
     if (state.paused == null) state.paused = false
+    if (state.pauseEngaged == null) state.pauseEngaged = false
     state.lastPrimaryTempMs = now()
     initialize()
     if (applyOnSave) evaluateNow()
@@ -129,14 +137,17 @@ def installed() {
 def updated() {
     if (state.forcedOffBySensor == null) state.forcedOffBySensor = false
     if (state.paused == null) state.paused = false
+    if (state.pauseEngaged == null) state.pauseEngaged = false
     if (state.lastPrimaryTempMs == null) state.lastPrimaryTempMs = now()
     unsubscribe()
     unschedule()
     initialize()
-    if (applyOnSave) evaluateNow()
+    def acted = handleActionRequest()
+    if (applyOnSave && !acted) evaluateNow()
 }
 
 def initialize() {
+    state.paused = isPaused()   // reconcile the display mirror from the switch
     if (contactSensors) {
         subscribe(contactSensors, "contact.open", sensorOpenHandler)
         subscribe(contactSensors, "contact.closed", sensorCloseHandler)
@@ -162,12 +173,19 @@ def initialize() {
     runEvery15Minutes("auditTempSource")
 
     if (isPaused()) {
-        enforcePauseQuietly()
+        if (!state.pauseEngaged) {
+            // Switch is ON but the pause sequence never completed (flipped during downtime, or restart mid-sequence)
+            logInfo "Pause switch is ON but the pause sequence did not complete — applying thermostat OFF and validating now"
+            pauseNow("restart reconciliation")
+        } else {
+            enforcePauseQuietly()
+        }
     } else {
-        // Recover a pending resume if the hub restarted mid-delay
-        if (state.pendingResume) {
-            runIn(resumeDelaySeconds(), "resumeCheck", [overwrite: true])
-            logInfo "Hub restart during resume delay — resume re-scheduled in ${resumeDelayMinutes()} min"
+        state.pauseEngaged = false
+        // Recover the COOL delay if the hub restarted mid-wait
+        if (state.pendingWarmApply) {
+            runIn(coolDelaySeconds(), "warmApplyCheck", [overwrite: true])
+            logInfo "Hub restart during COOL delay — timer re-armed in ${coolDelayMinutes()} min"
         }
         // Recover fan duty cycle if the hub restarted mid-cycle
         if (state.fanCycleActive) {
@@ -187,60 +205,226 @@ def initialize() {
             if (open) {
                 runIn(offDelaySeconds(), "closeoutCheck", [overwrite: true])
                 logInfo "Restart with sensor(s) open (${open.join(', ')}) — OFF check re-armed in ${offDelayMinutes()} min"
-            } else if (!state.pendingResume) {
-                // Sensors closed while the hub was down: the close event was lost
-                state.pendingResume = true
-                runIn(resumeDelaySeconds(), "resumeCheck", [overwrite: true])
-                logInfo "Restart after sensor-close during protection — resume re-scheduled in ${resumeDelayMinutes()} min"
+            } else {
+                // Sensors closed while the hub was down (close event lost) — rules re-apply right away
+                state.forcedOffBySensor = false
+                state.offReassertCount = 0
+                state.spReassertCount = 0
+                runIn(15, "resumeApplyRules", [overwrite: true])
+                logInfo "Restart after sensor-protection with all sensors closed — rules re-applied in 15 s"
             }
+        } else if (state.warmDelayInterrupted && !openSensors()) {
+            // A blip canceled the COOL delay before the restart; sensors are closed again — re-arm the wait
+            state.warmDelayInterrupted = false
+            state.pendingWarmApply = true
+            runIn(coolDelaySeconds(), "warmApplyCheck", [overwrite: true])
+            logInfo "Restart after a blip canceled the COOL delay — timer re-armed in ${coolDelayMinutes()} min"
         }
         // Verify mode/setpoints survived the restart if a band owns them
-        if (state.appliedBand && !state.forcedOffBySensor && !state.pendingResume) {
+        if (state.appliedBand && !state.forcedOffBySensor) {
             runIn(15, "reassertSetpoints", [overwrite: true])
             logInfo "Restart while '${state.appliedBand}' band owns mode/setpoints — verification check in 15 s"
         }
     }
 }
 
-// ---- maintenance pause ----
+// ---- maintenance pause (switch is the single source of truth) ----
 def isPaused() {
-    return state.paused == true
+    def v = pauseSwitch?.currentValue("switch")
+    if (v == null) return state.paused == true
+    return (v == "on")
 }
 
-def pauseNow(String source) {
-    if (state.paused) {
-        logDebug "Pause requested from ${source} but already paused"
-        return
-    }
-    state.paused = true
-    logInfo "MAINTENANCE PAUSE engaged (${source}) — automation is hands-off; wall thermostat has full control"
-    enforcePauseQuietly()
-    notifyUser("Maintenance PAUSE engaged — automation is hands-off; the wall thermostat has full control")
+// In-app actions: pause applies OFF + verifies BEFORE engaging; resume flips the switch off
+def handleActionRequest() {
+    def action = settings.btnAction
+    if (!action) return false
+    app.updateSetting("btnAction", [value: "", type: "enum"])
+    if (action == "pause") return pressPause()
+    if (action == "resume") return pressResume()
+    if (action == "test") return pressTest()
+    return false
 }
 
-def resumeNow(String source) {
-    if (!state.paused) {
-        logDebug "Resume requested from ${source} but not paused"
-        return
+def pressPause() {
+    if (isPaused()) {
+        logDebug "PAUSE requested but already paused (switch is on)"
+        return false
     }
-    state.paused = false
-    logInfo "MAINTENANCE PAUSE released (${source}) — automation resumes control"
-    notifyUser("Maintenance pause released — automation resumes control")
-    evaluateNow()
+    logInfo "PAUSE requested from app page — thermostat OFF first; the pause switch flips ON only after the thermostat confirms OFF"
+    pauseNow("app page")
+    return true
+}
+
+def pressResume() {
+    if (!isPaused()) {
+        logDebug "RESUME requested but not paused (switch is off)"
+        return false
+    }
+    logInfo "RESUME requested from app page — turning pause switch OFF"
+    pauseSwitch.off()
+    return true
+}
+
+def pressTest() {
+    logInfo "TEST Pushover requested from app page"
+    notifyUser(buildPushMessage("pause", [:]))
+    return true
 }
 
 def pauseAutomation(evt) { pauseNow("switch") }
 def resumeAutomation(evt) { resumeNow("switch") }
 
+// Pause sequence: apply OFF + fan auto to the device, verify, then engage hands-off.
+// Runs on every trigger (app Action, dashboard switch, device page, restart reconciliation).
+def pauseNow(String source) {
+    if (state.pauseEngaged) { logDebug "Pause already engaged (${source}) — nothing to do"; return }
+    logInfo "MAINTENANCE PAUSE requested (${source}) — sending thermostat OFF + fan auto; hands-off engages once the device confirms"
+    enforcePauseQuietly()
+    // Apply to the device UNCONDITIONALLY — never trust the attribute mirror on this path
+    thermostats.each { t ->
+        t.setThermostatMode("off")
+        logInfo "${t.displayName}: mode -> off (pause command sent)"
+    }
+    forceFanMode("auto", "pause — system off")
+    state.pauseValidCount = 0
+    runIn(5, "pauseValidateCheck", [overwrite: true])
+}
+
+def pauseValidateCheck() {
+    if (state.pauseEngaged) return
+    def badMode = thermostats.findAll { it.currentValue("thermostatMode") != "off" }
+    def badFan = thermostats.findAll { it.currentValue("thermostatFanMode") != "auto" }
+    if (!badMode && !badFan) {
+        logInfo "Pause verified: thermostat mode is OFF and fan is auto — engaging hands-off"
+        finishPauseEngage()
+        return
+    }
+    if ((state.pauseValidCount ?: 0) >= 3) {
+        def names = (badMode + badFan).collect { it.displayName }.unique().join(", ")
+        logWarn "Thermostat did not confirm OFF after ${1 + (state.pauseValidCount ?: 0)} attempts (${names}) — engaging pause anyway; the wall thermostat has control. If the system is still running, turn it off at the wall and check the Nexia connection."
+        notifyUser(buildPushMessage("pauseUnverified", [device: names]))
+        finishPauseEngage()
+        return
+    }
+    state.pauseValidCount = (state.pauseValidCount ?: 0) + 1
+    def detail = []
+    if (badMode) detail << "mode still '${badMode.collect { it.currentValue('thermostatMode') }.unique().join(', ')}' on ${badMode.collect { it.displayName }.join(', ')}"
+    if (badFan) detail << "fan still '${badFan.collect { it.currentValue('thermostatFanMode') }.unique().join(', ')}' on ${badFan.collect { it.displayName }.join(', ')}"
+    logWarn "Pause verification (attempt ${state.pauseValidCount}/3): ${detail.join('; ')} — re-sending commands"
+    badMode.each { it.setThermostatMode("off") }
+    badFan.each { it.setThermostatFanMode("auto") }
+    runIn(5, "pauseValidateCheck", [overwrite: true])
+}
+
+def finishPauseEngage() {
+    state.pauseEngaged = true
+    state.paused = true
+    state.pauseValidCount = 0
+    enforcePauseQuietly()
+    if (!isPaused()) {
+        // App-page path: the switch is still off — flipping it ON now completes the engagement
+        logInfo "Pause switch -> ON — automation hands off; the wall thermostat has full control"
+        pauseSwitch?.on()
+    } else {
+        // Switch-triggered path: already on
+        logInfo "Automation is hands-off; the wall thermostat has full control"
+    }
+    notifyUser(buildPushMessage("pause", [:]))
+    // Post-write re-check: catches a write the driver accepted but the Nexia cloud silently dropped
+    runIn(120, "pausePostCheck", [overwrite: true])
+}
+
+def pausePostCheck() {
+    if (!state.pauseEngaged) return
+    def bad = thermostats.findAll { it.currentValue("thermostatMode") != "off" }
+    if (!bad) { logDebug "pausePostCheck: thermostat mode still off — pause write confirmed"; return }
+    logWarn "Pause re-check: ${bad.collect { it.displayName }.join(', ')} now reports mode '${bad.collect { it.currentValue('thermostatMode') }.unique().join(', ')}' — the OFF write did not hold; re-sending once"
+    bad.each { it.setThermostatMode("off") }
+    runIn(15, "pausePostCheckFinal", [overwrite: true])
+}
+
+def pausePostCheckFinal() {
+    if (!state.pauseEngaged) return
+    def bad = thermostats.findAll { it.currentValue("thermostatMode") != "off" }
+    if (bad) {
+        logWarn "Thermostat is still not OFF while paused (${bad.collect { it.displayName }.unique().join(', ')}) — hands-off remains in effect and no further commands will be sent; turn it off at the wall and check the Nexia connection."
+        notifyUser(buildPushMessage("pauseUnverified", [device: bad.collect { it.displayName }.unique().join(", ")]))
+    } else {
+        logInfo "Pause re-check passed: thermostat mode is OFF — hands-off remains"
+    }
+}
+
+def resumeNow(String source) {
+    if (!isPaused()) {
+        logDebug "Resume requested from ${source} but not paused"
+        return
+    }
+    state.paused = false
+    state.pauseEngaged = false
+    unschedule("pauseValidateCheck")
+    unschedule("pausePostCheck")
+    unschedule("pausePostCheckFinal")
+    logInfo "MAINTENANCE PAUSE released (${source}) — automation resumes control"
+    notifyUser(buildPushMessage("resume", [:]))
+    resumeApplyRules()
+}
+
+// Shared re-apply path (pause resume + sensor clear): apply now, except COOL gets the delay
+def resumeApplyRules() {
+    state.warmDelayInterrupted = false   // any deliberate re-apply supersedes an interrupted delay
+    def open = openSensors()
+    if (open) {
+        // Sensors opened — protection takes over instead of rules
+        state.appliedBand = null
+        state.spReassertCount = 0
+        stopFanCycle()
+        runIn(offDelaySeconds(), "closeoutCheck", [overwrite: true])
+        logInfo "Sensor(s) open (${open.join(', ')}) — OFF check scheduled in ${offDelayMinutes()} min"
+        return
+    }
+    def src = resolveSource()
+    announceTransition(src)
+    if (src.temp == null) {
+        state.lastEvalSkipped = true
+        logWarn "No outdoor temperature available from primary or backup — rules paused (15-min audit will retry)"
+        return
+    }
+    state.lastEvalSkipped = false
+    def band = bandFor(src.temp)
+    logInfo "Re-applying rules: outdoor ${src.temp}°F (${src.source}) -> ${band} band"
+    if (band == "warm") {
+        state.pendingWarmApply = true
+        runIn(coolDelaySeconds(), "warmApplyCheck", [overwrite: true])
+        logInfo "COOL application delayed ${coolDelayMinutes()} min — thermostat stays off during the wait"
+    } else {
+        applyRules(src)
+    }
+}
+
+def warmApplyCheck() {
+    state.pendingWarmApply = false
+    if (isPaused()) { logDebug "warmApplyCheck: paused — skip"; return }
+    def open = openSensors()
+    if (open) {
+        logWarn "warmApplyCheck: sensor(s) open (${open.join(', ')}) — sensor protection owns the thermostat; rules not applied"
+        return
+    }
+    logInfo "COOL delay elapsed — re-applying outdoor temperature rules"
+    evaluateOutdoorRules()
+}
+
 def enforcePauseQuietly() {
     unschedule("closeoutCheck")
-    unschedule("resumeCheck")
+    unschedule("warmApplyCheck")
+    unschedule("resumeApplyRules")
     unschedule("reassertOff")
     unschedule("reassertFan")
     unschedule("reassertSetpoints")
     unschedule("fanOnPhase")
     unschedule("fanOffPhase")
-    state.pendingResume = false
+    state.pendingWarmApply = false
+    state.warmDelayInterrupted = false
     state.forcedOffBySensor = false
     state.appliedBand = null
     state.offReassertCount = 0
@@ -254,10 +438,11 @@ def enforcePauseQuietly() {
 def sensorOpenHandler(evt) {
     if (isPaused()) { logDebug "Paused — ignoring sensor open (${evt.displayName})"; return }
     logInfo "Sensor opened: ${evt.displayName}"
-    if (state.pendingResume) {
-        state.pendingResume = false
-        unschedule("resumeCheck")
-        logInfo "Pending resume canceled (sensor reopened)"
+    if (state.pendingWarmApply) {
+        state.pendingWarmApply = false
+        unschedule("warmApplyCheck")
+        state.warmDelayInterrupted = true
+        logInfo "COOL delay canceled (sensor opened) — re-armed if the sensor closes before the OFF timer fires"
     }
     state.appliedBand = null
     state.spReassertCount = 0
@@ -284,7 +469,7 @@ def closeoutCheck() {
             logDebug "${t.displayName} already off"
         }
     }
-    // Sensor protection owns the thermostat state from here until resume
+    // Sensor protection owns the thermostat state from here until all sensors close
     state.forcedOffBySensor = true
 }
 
@@ -299,27 +484,26 @@ def sensorCloseHandler(evt) {
     // All closed: cancel a pending OFF that hasn't fired yet
     unschedule("closeoutCheck")
     if (state.forcedOffBySensor) {
-        state.pendingResume = true
-        runIn(resumeDelaySeconds(), "resumeCheck", [overwrite: true])
-        logInfo "All sensors closed — re-evaluating outdoor temp rules in ${resumeDelayMinutes()} min"
+        state.forcedOffBySensor = false
+        state.offReassertCount = 0
+        state.spReassertCount = 0
+        logInfo "All sensors closed after sensor-protection OFF — re-applying outdoor temperature rules"
+        resumeApplyRules()
+    } else if (state.warmDelayInterrupted) {
+        // A blip canceled an in-progress COOL delay — re-arm the wait (thermostat stays off)
+        state.warmDelayInterrupted = false
+        logInfo "All sensors closed during a canceled COOL delay — delay re-armed for ${coolDelayMinutes()} min (thermostat stays off)"
+        thermostats.each { t ->
+            if (t.currentValue("thermostatMode") != "off") {
+                t.setThermostatMode("off")
+                logInfo "${t.displayName}: mode -> off (COOL delay wait)"
+            }
+        }
+        state.pendingWarmApply = true
+        runIn(coolDelaySeconds(), "warmApplyCheck", [overwrite: true])
     } else {
         logDebug "All sensors closed; thermostat was not forced off — nothing to resume"
     }
-}
-
-def resumeCheck() {
-    if (isPaused()) { logDebug "Paused — resumeCheck skipped"; return }
-    state.pendingResume = false
-    def open = openSensors()
-    if (open) {
-        logWarn "resumeCheck: sensor(s) open again (${open.join(', ')}) — staying off"
-        return
-    }
-    state.forcedOffBySensor = false
-    state.offReassertCount = 0
-    state.spReassertCount = 0
-    logInfo "Resume delay elapsed — re-applying outdoor temperature rules"
-    evaluateOutdoorRules()
 }
 
 // ---- outdoor temperature: primary, backup, failover ----
@@ -332,8 +516,8 @@ def primaryTempHandler(evt) {
         logInfo "Sensor(s) open (${open.join(', ')}) — outdoor temp rules suppressed; sensor protection handles OFF if it stays open"
         return
     }
-    if (state.pendingResume) {
-        logInfo "Within post-close delay — rules will be applied when the ${resumeDelayMinutes()} min resume fires"
+    if (state.pendingWarmApply) {
+        logInfo "Within COOL delay — rules will be applied when the ${coolDelayMinutes()} min timer fires"
         return
     }
     evaluateOutdoorRules()
@@ -351,8 +535,8 @@ def backupTempHandler(evt) {
         logInfo "Sensor(s) open — rules suppressed"
         return
     }
-    if (state.pendingResume) {
-        logInfo "Within post-close delay — rules will be applied when the resume fires"
+    if (state.pendingWarmApply) {
+        logInfo "Within COOL delay — rules will be applied when the timer fires"
         return
     }
     evaluateOutdoorRules()
@@ -409,21 +593,21 @@ def announceTransition(Map src) {
     switch (cur) {
         case "backup":
             logWarn "Primary outdoor temp stale (last update ${ageH}) — failing over to backup ${backupOutdoorSensor?.displayName} (${src.backup}°F)"
-            notifyUser("Primary outdoor temp stale (last update ${ageH}) — failing over to backup ${backupOutdoorSensor?.displayName} (${src.backup}°F)")
+            notifyUser(buildPushMessage("failover", [device: backupOutdoorSensor?.displayName, temp: src.backup, age: ageH]))
             break
         case "primary-stale":
             logWarn "Primary outdoor temp stale (last update ${ageH}), no backup available — rules frozen on last known ${src.primary}°F"
-            notifyUser("Primary outdoor temp stale (last update ${ageH}), no backup available — thermostat rules frozen on last known ${src.primary}°F")
+            notifyUser(buildPushMessage("stale", [temp: src.primary, age: ageH]))
             break
         case "primary":
             if (prev != null) {
                 logInfo "Primary outdoor temp recovered — resuming primary source"
-                notifyUser("Primary outdoor temp recovered — using primary source again")
+                notifyUser(buildPushMessage("recovered", [:]))
             }
             break
         case "none":
             logWarn "No outdoor temperature available from primary or backup — rules paused"
-            notifyUser("No outdoor temperature available (primary and backup) — thermostat rules paused")
+            notifyUser(buildPushMessage("notemp", [:]))
             break
     }
 }
@@ -437,7 +621,7 @@ def auditTempSource() {
     if (isPaused()) { logDebug "audit: paused — skip"; return }
     def open = openSensors()
     if (open) { logDebug "audit: sensor(s) open — skip"; return }
-    if (state.pendingResume) { logDebug "audit: resume pending — skip"; return }
+    if (state.pendingWarmApply) { logDebug "audit: COOL delay pending — skip"; return }
     def src = resolveSource()
     if (src.source != (state.tempSourceActive ?: "none") || state.lastEvalSkipped) {
         logInfo "Outdoor temp audit: source '${state.tempSourceActive ?: 'none'}' -> '${src.source}' — re-evaluating"
@@ -457,8 +641,57 @@ def backupValue() {
     return num(backupOutdoorSensor.currentValue("temperature"))
 }
 
+// ---- pushover text: templates, tokens, prefix ----
+def cfgText(String name, String fallback) {
+    def v = settings[name]
+    if (v == null) return fallback
+    def s = v.toString().trim()
+    return s ? s : fallback   // cleared field = built-in default, never an empty push
+}
+
+def renderTemplate(String text, Map bindings) {
+    if (!text) return ""
+    def out = text
+    bindings.each { k, v ->
+        if (v != null) out = out.replace("{${k}}", v.toString())
+    }
+    return out
+}
+
+def buildPushMessage(String type, Map bindings) {
+    def text
+    switch (type) {
+        case "pause":
+            text = cfgText("msgPause", "Maintenance PAUSE engaged — thermostat turned OFF; automation is hands-off; the wall thermostat has full control")
+            break
+        case "pauseUnverified":
+            text = cfgText("msgPauseUnverified", "PAUSE engaged but the thermostat did not confirm OFF ({device}) — if it is still running, turn it off at the wall and check the Nexia connection")
+            break
+        case "resume":
+            text = cfgText("msgResume", "Maintenance pause released — automation resumes control")
+            break
+        case "failover":
+            text = cfgText("msgFailover", "Primary outdoor temp stale (last update {age}) — failing over to backup {device} ({temp}°F)")
+            break
+        case "stale":
+            text = cfgText("msgStale", "Primary outdoor temp stale (last update {age}), no backup available — thermostat rules frozen on last known {temp}°F")
+            break
+        case "recovered":
+            text = cfgText("msgRecovered", "Primary outdoor temp recovered — using primary source again")
+            break
+        case "notemp":
+            text = cfgText("msgNoTemp", "No outdoor temperature available (primary and backup) — thermostat rules paused")
+            break
+        default:
+            text = ""
+    }
+    return renderTemplate(text, bindings)
+}
+
 def notifyUser(String msg) {
-    def line = "Nexia Thermostat Guard: ${msg}"
+    def prefix = settings["notifyPrefix"]
+    def prefixStr = (prefix == null) ? "Nexia Thermostat Guard" : prefix.toString().trim()
+    def line = prefixStr ? "${prefixStr}: ${msg}" : msg
     def devs = (pushoverDevices instanceof List) ? pushoverDevices : (pushoverDevices ? [pushoverDevices] : [])
     if (!settings.notifyFailover || !devs) {
         log.warn "${line} (no Pushover device configured)"
@@ -479,9 +712,11 @@ def evaluateNow() {
     if (isPaused()) { logDebug "Paused — evaluateNow skipped"; return }
     def open = openSensors()
     if (open) {
-        if (state.pendingResume) {
-            state.pendingResume = false
-            unschedule("resumeCheck")
+        if (state.pendingWarmApply) {
+            state.pendingWarmApply = false
+            unschedule("warmApplyCheck")
+            state.warmDelayInterrupted = true
+            logInfo "COOL delay canceled (sensor opened at save) — re-armed if the sensor closes before the OFF timer fires"
         }
         state.appliedBand = null
         state.spReassertCount = 0
@@ -490,11 +725,17 @@ def evaluateNow() {
         logInfo "Sensor(s) open at save (${open.join(', ')}) — OFF check scheduled in ${offDelayMinutes()} min"
         return
     }
-    if (state.pendingResume) {
-        logInfo "Resume already scheduled — rules will apply in ≤${resumeDelayMinutes()} min"
+    if (state.pendingWarmApply) {
+        logInfo "COOL delay in progress — rules apply in ≤${coolDelayMinutes()} min"
         return
     }
     evaluateOutdoorRules()
+}
+
+def bandFor(temp) {
+    def warm = num(settings.mildThreshold) ?: 55
+    def cold = num(settings.coldThreshold) ?: 45
+    return (temp <= cold) ? "cold" : (temp < warm) ? "off" : "warm"
 }
 
 def applyRules(Map src) {
@@ -506,9 +747,7 @@ def applyRules(Map src) {
         return
     }
     state.lastEvalSkipped = false
-    def mild = num(settings.mildThreshold) ?: 55
-    def cold = num(settings.coldThreshold) ?: 45
-    def band = (outdoor <= cold) ? "cold" : (outdoor < mild) ? "off" : "mild"
+    def band = bandFor(outdoor)
     logInfo "Outdoor ${outdoor}°F (${src.source}) -> ${band}"
     thermostats.each { t ->
         switch (band) {
@@ -528,9 +767,9 @@ def applyRules(Map src) {
                     setFanMode("auto", "OFF band, fan circulation disabled")
                 }
                 break
-            case "mild":
+            case "warm":
                 stopFanCycle()
-                applyCoolBand(t, num(settings.mildCoolSp) ?: 71, "mild")
+                applyCoolBand(t, num(settings.mildCoolSp) ?: 71, "warm")
                 break
             case "cold":
                 stopFanCycle()
@@ -580,7 +819,7 @@ def applyCoolBand(t, coolSp, band) {
 def modeHandler(evt) {
     logDebug "thermostatMode event: ${evt.displayName} -> ${evt.value}"
     if (isPaused()) return
-    if (state.forcedOffBySensor && !state.pendingResume) {
+    if (state.forcedOffBySensor) {
         if (evt.value == "off") {
             state.offReassertCount = 0
             return
@@ -590,7 +829,7 @@ def modeHandler(evt) {
         runIn(10, "reassertOff", [overwrite: true])
         return
     }
-    if (state.appliedBand && !state.pendingResume) {
+    if (state.appliedBand) {
         def exp = expectedOwnership()
         if (exp && evt.value != exp.mode) {
             logWarn "${evt.displayName}: expected mode '${exp.mode}' but shows '${evt.value}' — re-check in 10 s"
@@ -601,7 +840,7 @@ def modeHandler(evt) {
 
 def reassertOff() {
     if (isPaused()) return
-    if (!state.forcedOffBySensor || state.pendingResume) return
+    if (!state.forcedOffBySensor) return
     def open = openSensors()
     if (!open) { state.offReassertCount = 0; return }
     def offenders = thermostats.findAll { it.currentValue("thermostatMode") != "off" }
@@ -625,7 +864,7 @@ def reassertOff() {
 def fanModeHandler(evt) {
     logDebug "thermostatFanMode event: ${evt.displayName} -> ${evt.value}"
     if (isPaused()) return
-    if (!state.fanCycleActive || state.pendingResume) return
+    if (!state.fanCycleActive) return
     if (openSensors()) return
     def expected = (state.fanPhase == "off") ? "auto" : (settings.fanActiveMode ?: "on")
     if (evt.value == expected) {
@@ -638,7 +877,7 @@ def fanModeHandler(evt) {
 
 def reassertFan() {
     if (isPaused()) return
-    if (!state.fanCycleActive || state.pendingResume) return
+    if (!state.fanCycleActive) return
     if (openSensors()) return
     def expected = (state.fanPhase == "off") ? "auto" : (settings.fanActiveMode ?: "on")
     def offenders = thermostats.findAll { it.currentValue("thermostatFanMode") != expected }
@@ -663,7 +902,7 @@ def expectedOwnership() {
     if (state.appliedBand == "cold") {
         return [mode: "heat", heat: num(settings.coldHeatSp) ?: 72, cool: null]
     }
-    if (state.appliedBand == "mild") {
+    if (state.appliedBand == "warm") {
         return [mode: "cool", heat: null, cool: num(settings.mildCoolSp) ?: 71]
     }
     return null
@@ -672,7 +911,7 @@ def expectedOwnership() {
 def setpointHandler(evt) {
     logDebug "${evt.name} event: ${evt.displayName} -> ${evt.value}"
     if (isPaused()) return
-    if (!state.appliedBand || state.forcedOffBySensor || state.pendingResume) return
+    if (!state.appliedBand || state.forcedOffBySensor) return
     if (openSensors()) return
     def exp = expectedOwnership()
     if (exp == null) { state.appliedBand = null; return }
@@ -697,7 +936,7 @@ def setpointHandler(evt) {
 
 def reassertSetpoints() {
     if (isPaused()) return
-    if (!state.appliedBand || state.forcedOffBySensor || state.pendingResume) return
+    if (!state.appliedBand || state.forcedOffBySensor) return
     if (openSensors()) return
     def exp = expectedOwnership()
     if (exp == null) return
@@ -814,6 +1053,13 @@ def setFanMode(String mode, String note) {
     }
 }
 
+def forceFanMode(String mode, String note) {
+    thermostats.each { t ->
+        t.setThermostatFanMode(mode)
+        logInfo "${t.displayName}: fan mode -> ${mode}${note ? ' (' + note + ')' : ''}"
+    }
+}
+
 // ---- helpers ----
 def num(v) {
     if (v == null) return null
@@ -831,13 +1077,13 @@ def openSensors() {
 }
 
 def offDelayMinutes()    { return intSetting(settings.offDelayMinutes, 2) }
-def resumeDelayMinutes() { return intSetting(settings.resumeDelayMinutes, 5) }
+def coolDelayMinutes()   { return intSetting(settings.coolDelayMinutes, 5) }
 def fanActiveMinutes()   { return intSetting(settings.fanOnMinutes, 30) }
 def fanRestMinutes()     { return intSetting(settings.fanOffMinutes, 30) }
 def stalenessHoursInt()  { return intSetting(settings.stalenessHours, 3) }
 
 def offDelaySeconds()    { return (offDelayMinutes() * 60) as Integer }
-def resumeDelaySeconds() { return (resumeDelayMinutes() * 60) as Integer }
+def coolDelaySeconds()   { return (coolDelayMinutes() * 60) as Integer }
 def fanActiveSeconds()   { return (fanActiveMinutes() * 60) as Integer }
 def fanRestSeconds()     { return (fanRestMinutes() * 60) as Integer }
 def stalenessMs()        { return stalenessHoursInt() * 3600000L }
