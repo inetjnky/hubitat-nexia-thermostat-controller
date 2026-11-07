@@ -1,8 +1,8 @@
 definition(
     name: "Nexia Thermostat Controller",
     namespace: "jason",
-    author: "inetjnky",
-    description: "Thermostat OFF when a contact sensor stays open (2 min); outdoor-temp rules (HEAT at/below 45, COOL at/above 55, OFF+fan cycle between) with selectable primary/backup temp sources + auto failover and Pushover alerts (customizable text). Watchdogs re-assert mode/setpoints/fan. Maintenance pause (via required pause switch) sends thermostat OFF + fan auto, verifies the device confirms, then engages hands-off; rules re-apply on resume or sensor-clear, delaying COOL by the configured minutes (a brief sensor blip during the wait re-arms it).",
+    author: "Inetjnky",
+    description: "Thermostat OFF when a contact sensor stays open (2 min); outdoor-temp rules (HEAT at/below 45, COOL at/above 55, OFF+fan cycle between) with selectable primary/backup temp sources + auto failover and Pushover alerts (customizable text). Watchdogs re-assert mode/setpoints/fan. Maintenance pause (via required pause switch) sends thermostat OFF + fan auto, verifies the device confirms, then engages hands-off; rules re-apply on resume or sensor-clear — COOL optionally delayed by the configured minutes (0 = immediate, HVAC compressor lockout provides the protection; a brief sensor blip during a configured wait re-arms it).",
     category: "Convenience",
     iconUrl: "",
     iconX2Url: "",
@@ -27,13 +27,13 @@ def mainPage() {
             input "btnAction", "enum",
                 title: "Action — choose an option to execute (acts like a button)",
                 options: ["pause": "⏸ PAUSE — thermostat OFF, verified, then hands-off",
-                          "resume": "▶ RESUME — automation re-takes control (COOL delayed)",
+                          "resume": "▶ RESUME — automation re-takes control (COOL per delay setting)",
                           "test": "🔔 TEST — send your configured Pause message now"],
                 required: false, submitOnChange: true
             input "coolDelayMinutes", "number",
-                title: "Minutes to delay COOL mode on resume or after all sensors close (thermostat stays off during the delay)",
-                defaultValue: 5, range: "1..120", required: true
-            paragraph "PAUSE sends mode off + fan auto, verifies the thermostat actually reports OFF (up to 3 re-sends), then engages hands-off — the in-app Action flips the pause switch ON only after that verification; flipping the switch from a dashboard runs the same apply-then-verify sequence. If OFF can't be verified, the pause still engages and you get a Pushover alert. RESUME turns the switch OFF and re-applies the outdoor-temp rules immediately — except COOL, which waits the minutes configured above while the thermostat stays off. While the switch is ON: no sensor OFF, no outdoor-temp rules, no fan duty cycle, no watchdogs. Pause state survives hub reboots."
+                title: "Minutes to delay COOL mode on resume or after all sensors close — 0 = OFF",
+                defaultValue: 5, range: "0..120", required: true
+            paragraph "PAUSE sends mode off + fan auto, verifies the thermostat actually reports OFF (up to 3 re-sends), then engages hands-off — the in-app Action flips the pause switch ON only after that verification; flipping the switch from a dashboard runs the same apply-then-verify sequence. If OFF can't be verified, the pause still engages and you get a Pushover alert. RESUME turns the switch OFF and re-applies the outdoor-temp rules immediately — except COOL, which waits the minutes configured above while the thermostat stays off; set 0 to skip the app delay and let the HVAC's factory compressor lockout provide the protection (Verify with your manufacturer if your HVAC has a factory compressor lockout enabled). While the switch is ON: no sensor OFF, no outdoor-temp rules, no fan duty cycle, no watchdogs. Pause state survives hub reboots."
         }
         section("Contact sensors") {
             input "contactSensors", "capability.contactSensor",
@@ -43,7 +43,7 @@ def mainPage() {
                 input "offDelayMinutes", "number",
                     title: "Minutes a sensor must stay open before OFF (timer restarts if another opens)",
                     defaultValue: 2, range: "1..120", required: true
-                paragraph "After a sensor-protection OFF, once ALL sensors close the outdoor-temp rules re-apply immediately — except COOL, which waits the delay configured in the pause/resume section (thermostat stays off during that wait). A brief open→close blip during that COOL wait re-arms the wait."
+                paragraph "After a sensor-protection OFF, once ALL sensors close the outdoor-temp rules re-apply immediately — except COOL, which waits the delay configured in the pause/resume section (0 = apply immediately, HVAC compressor lockout protects the compressor; during a configured wait the thermostat stays off, and a brief open→close blip re-arms the wait)."
             }
         }
         section("Outdoor temperature rules (°F)") {
@@ -370,7 +370,7 @@ def resumeNow(String source) {
     resumeApplyRules()
 }
 
-// Shared re-apply path (pause resume + sensor clear): apply now, except COOL gets the delay
+// Shared re-apply path (pause resume + sensor clear): apply now, except COOL optionally delayed
 def resumeApplyRules() {
     state.warmDelayInterrupted = false   // any deliberate re-apply supersedes an interrupted delay
     def open = openSensors()
@@ -394,9 +394,17 @@ def resumeApplyRules() {
     def band = bandFor(src.temp)
     logInfo "Re-applying rules: outdoor ${src.temp}°F (${src.source}) -> ${band} band"
     if (band == "warm") {
-        state.pendingWarmApply = true
-        runIn(coolDelaySeconds(), "warmApplyCheck", [overwrite: true])
-        logInfo "COOL application delayed ${coolDelayMinutes()} min — thermostat stays off during the wait"
+        def dmin = coolDelayMinutes()
+        if (dmin == 0) {
+            // App-side delay disabled — apply COOL now; the HVAC's fixed 5-min compressor
+            // anti-short-cycle lockout (also after power interruptions) protects the compressor
+            logInfo "COOL delay disabled (0) — applying COOL immediately; the HVAC's built-in compressor lockout manages short-cycle protection"
+            applyRules(src)
+        } else {
+            state.pendingWarmApply = true
+            runIn(dmin * 60, "warmApplyCheck", [overwrite: true])
+            logInfo "COOL application delayed ${dmin} min — thermostat stays off during the wait"
+        }
     } else {
         applyRules(src)
     }
@@ -1071,13 +1079,18 @@ def intSetting(v, Integer fallback) {
     return (n != null && n > 0) ? n.intValue() : fallback
 }
 
+// 0 is a valid value here (delay disabled) — unlike intSetting, which treats <=0 as "use fallback"
+def coolDelayMinutes() {
+    def n = num(settings.coolDelayMinutes)
+    return (n != null && n >= 0) ? n.intValue() : 5
+}
+
 def openSensors() {
     def sensors = (contactSensors instanceof List) ? contactSensors : (contactSensors ? [contactSensors] : [])
     return sensors.findAll { it.currentValue("contact") == "open" }?.collect { it.displayName }
 }
 
 def offDelayMinutes()    { return intSetting(settings.offDelayMinutes, 2) }
-def coolDelayMinutes()   { return intSetting(settings.coolDelayMinutes, 5) }
 def fanActiveMinutes()   { return intSetting(settings.fanOnMinutes, 30) }
 def fanRestMinutes()     { return intSetting(settings.fanOffMinutes, 30) }
 def stalenessHoursInt()  { return intSetting(settings.stalenessHours, 3) }
